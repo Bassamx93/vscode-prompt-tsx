@@ -2,7 +2,9 @@
  *  Copyright (c) Microsoft Corporation and GitHub. All rights reserved.
  *--------------------------------------------------------------------------------------------*/
 
-import type { CancellationToken, InteractiveEditorProgressItem, InteractiveEditorReplyFollowup, Location, Progress, Range, TextEdit, Uri, WorkspaceEdit } from "vscode";
+import type { Location, ThemeIcon, Uri } from 'vscode';
+import * as JSON from './jsonTypes';
+import { URI } from './util/vs/common/uri';
 
 /**
  * Arbitrary metadata which can be retrieved after the prompt is rendered.
@@ -14,52 +16,52 @@ export abstract class PromptMetadata {
 	}
 }
 
+export enum ChatResponseReferencePartStatusKind {
+	Complete = 1,
+	Partial = 2,
+	Omitted = 3,
+}
+
 /**
  * A reference used for creating the prompt.
  */
 export class PromptReference {
+	public static fromJSON(json: JSON.PromptReferenceJSON): PromptReference {
+		// todo@connor4312: do we need to create concrete Location/Range types?
+		const uriOrLocation = (v: JSON.UriOrLocationJSON): Uri | Location =>
+			'scheme' in v ? URI.from(v) : { uri: URI.from(v.uri), range: v.range };
+
+		return new PromptReference(
+			'variableName' in json.anchor
+				? {
+						variableName: json.anchor.variableName,
+						value: json.anchor.value && uriOrLocation(json.anchor.value),
+				  }
+				: uriOrLocation(json.anchor),
+			json.iconPath &&
+				('scheme' in json.iconPath
+					? URI.from(json.iconPath)
+					: 'light' in json.iconPath
+					? { light: URI.from(json.iconPath.light), dark: URI.from(json.iconPath.dark) }
+					: json.iconPath),
+			json.options
+		);
+	}
+
 	constructor(
 		readonly anchor: Uri | Location | { variableName: string; value?: Uri | Location },
-	) { }
+		readonly iconPath?: Uri | ThemeIcon | { light: Uri; dark: Uri },
+		readonly options?: {
+			status?: { description: string; kind: ChatResponseReferencePartStatusKind };
+			isFromTool?: boolean;
+		}
+	) {}
+
+	public toJSON(): JSON.PromptReferenceJSON {
+		return {
+			anchor: this.anchor,
+			iconPath: this.iconPath,
+			options: this.options,
+		};
+	}
 }
-
-export type ReplyInterpreterFactory = (progress: ReplyInterpreterProgress, streamEdits: boolean) => ReplyInterpreter;
-export type ReplyInterpreterProgress = Progress<InteractiveEditorProgressItem>;
-export interface ReplyInterpreter {
-	update(newText: string): { shouldFinish: boolean };
-	finish(): Promise<IParsedReply>;
-}
-
-export interface IInlineEditReply {
-	type: 'inlineEdit';
-	edits: TextEdit[];
-	newWholeRange: Range | undefined;
-	store?: ISessionTurnStorage;
-	content?: string;
-	followUp?: GenerateFollowups;
-}
-
-export interface IWorkspaceEditReply {
-	type: 'workspaceEdit';
-	workspaceEdit: WorkspaceEdit;
-	content?: string;
-	followUp?: GenerateFollowups;
-}
-
-export interface IConversationalReply {
-	type: 'conversational';
-	content: string;
-	followUp?: GenerateFollowups;
-}
-
-export type IParsedReply = (IInlineEditReply | IWorkspaceEditReply | IConversationalReply);
-
-/**
- * Some data that can be saved in the session across turns.
- */
-export interface ISessionTurnStorage {
-	lastDocumentContent: string;
-	lastWholeRange: Range;
-}
-
-export type GenerateFollowups = (token: CancellationToken) => Promise<InteractiveEditorReplyFollowup[] | undefined>;

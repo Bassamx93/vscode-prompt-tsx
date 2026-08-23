@@ -2,24 +2,75 @@
  *  Copyright (c) Microsoft Corporation and GitHub. All rights reserved.
  *--------------------------------------------------------------------------------------------*/
 
-import type { CancellationToken, Progress } from "vscode";
-import { BaseTokensPerCompletion, BaseTokensPerMessage, BaseTokensPerName, ChatMessage, ChatRole } from "./openai";
-import { PromptElement } from "./promptElement";
-import { BaseChatMessage, ChatMessagePromptElement, TextChunk, isChatMessagePromptElement } from "./promptElements";
-import { PromptMetadata, PromptReference, ReplyInterpreterFactory } from "./results";
-import { Cl100KBaseTokenizer, ITokenizer } from "./tokenizer/tokenizer";
-import { BasePromptElementProps, IChatEndpointInfo, PromptElementCtor, PromptPiece, PromptPieceChild, PromptSizing } from "./types";
-import { coalesce } from "./util/arrays";
-import { URI } from "./util/vs/common/uri";
-import { ChatDocumentContext, ChatResponsePart } from "./vscodeTypes";
+import type { CancellationToken, Progress } from 'vscode';
+import * as JSONT from './jsonTypes';
+import { PromptNodeType } from './jsonTypes';
+import {
+	BudgetExceededError,
+	ContainerFlags,
+	GenericMaterializedContainer,
+	LineBreakBefore,
+	MaterializedChatMessage,
+	MaterializedChatMessageBreakpoint,
+	MaterializedChatMessageDocument,
+	MaterializedChatMessageImage,
+	MaterializedChatMessageOpaque,
+	MaterializedChatMessageTextChunk,
+} from './materialized';
+import { ModeToChatMessageType, OutputMode, Raw, toMode } from './output/mode';
+import { PromptElement } from './promptElement';
+import {
+	AbstractKeepWith,
+	AssistantMessage,
+	BaseChatMessage,
+	Document,
+	Image,
+	ChatMessagePromptElement,
+	Chunk,
+	Expandable,
+	IfEmpty,
+	isChatMessagePromptElement,
+	KeepWithCtor,
+	LegacyPrioritization,
+	LogicalWrapper,
+	TextChunk,
+	TokenLimit,
+	TokenLimitProps,
+	ToolMessage,
+	useKeepWith,
+} from './promptElements';
+import { PromptMetadata, PromptReference } from './results';
+import { ITokenizer } from './tokenizer/tokenizer';
+import { ITracer } from './tracer';
+import {
+	BasePromptElementProps,
+	IChatEndpointInfo,
+	PromptElementCtor,
+	PromptPiece,
+	PromptPieceChild,
+	PromptSizing,
+} from './types';
+import { URI } from './util/vs/common/uri';
+import { ChatDocumentContext, ChatResponsePart } from './vscodeTypes';
 
-export interface RenderPromptResult {
-	readonly messages: ChatMessage[];
+export interface RenderPromptResult<M extends OutputMode = OutputMode.Raw> {
+	readonly messages: ModeToChatMessageType[M][];
 	readonly tokenCount: number;
 	readonly hasIgnoredFiles: boolean;
+	readonly metadata: MetadataMap;
+	/**
+	 * The references that survived prioritization in the rendered {@link RenderPromptResult.messages messages}.
+	 */
+	readonly references: PromptReference[];
+
+	/**
+	 * The references attached to chat message chunks that did not survive prioritization.
+	 */
+	readonly omittedReferences: PromptReference[];
 }
 
 export type QueueItem<C, P> = {
+	path: (PromptElementCtor<any, any> | string)[];
 	node: PromptTreeElement;
 	ctor: C;
 	props: P;
@@ -28,11 +79,20 @@ export type QueueItem<C, P> = {
 
 export interface MetadataMap {
 	get<T extends PromptMetadata>(key: new (...args: any[]) => T): T | undefined;
+	getAll<T extends PromptMetadata>(key: new (...args: any[]) => T): T[];
 }
 
 export namespace MetadataMap {
 	export const empty: MetadataMap = {
-		get: () => undefined
+		get: () => undefined,
+		getAll: () => [],
+	};
+
+	export const from = (metadata: PromptMetadata[]): MetadataMap => {
+		return {
+			get: ctor => metadata.find(m => m instanceof ctor) as any,
+			getAll: ctor => metadata.filter(m => m instanceof ctor) as any,
+		};
 	};
 }
 
@@ -41,23 +101,16 @@ export namespace MetadataMap {
  *
  * Note: You must create a fresh prompt renderer instance for each prompt element you want to render.
  */
-export class PromptRenderer<P extends BasePromptElementProps> {
-
-	// map the constructor to the meta data instances
-	private readonly _meta: Map<new () => PromptMetadata, PromptMetadata> = new Map();
+export class PromptRenderer<P extends BasePromptElementProps, M extends OutputMode> {
 	private readonly _usedContext: ChatDocumentContext[] = [];
-	private readonly _references: PromptReference[] = [];
 	private readonly _ignoredFiles: URI[] = [];
-	private _replyInterpreterFactory: ReplyInterpreterFactory | null = null;
-	private readonly _queue: QueueItem<PromptElementCtor<P, any>, P>[] = [];
-	private readonly _root = new PromptTreeElement(null, 0, {
-		tokenBudget: this._endpoint.modelMaxPromptTokens,
-		endpoint: this._endpoint
-	});
-	private readonly _tokenizer: ITokenizer;
+	private readonly _growables: { initialConsume: number; elem: PromptTreeElement }[] = [];
+	private readonly _root = new PromptTreeElement(null, 0);
+	private readonly _tokenLimits: { limit: number; id: number }[] = [];
+	/** Epoch used to tracing the order in which elements render. */
+	public tracer: ITracer | undefined = undefined;
 
 	/**
-	 *
 	 * @param _endpoint The chat endpoint that the rendered prompt will be sent to.
 	 * @param _ctor The prompt element constructor to render.
 	 * @param _props The props to pass to the prompt element.
@@ -66,136 +119,260 @@ export class PromptRenderer<P extends BasePromptElementProps> {
 		private readonly _endpoint: IChatEndpointInfo,
 		private readonly _ctor: PromptElementCtor<P, any>,
 		private readonly _props: P,
-		_tokenizer?: ITokenizer
-	) {
-		this._tokenizer = _tokenizer ?? new Cl100KBaseTokenizer();
-		this._queue.push({ node: this._root, ctor: this._ctor, props: this._props, children: [] });
-	}
-
-	public getAllMeta(): MetadataMap {
-		const metadataMap = this._meta;
-		return {
-			get<T extends PromptMetadata>(key: new (...args: any[]) => T): T | undefined {
-				return metadataMap.get(key) as T | undefined;
-			}
-		};
-	}
+		private readonly _tokenizer: ITokenizer<M>
+	) {}
 
 	public getIgnoredFiles(): URI[] {
 		return Array.from(new Set(this._ignoredFiles));
-	}
-
-	public getMeta<T extends PromptMetadata>(key: new (...args: any[]) => T): T | undefined {
-		return this._meta.get(key) as T | undefined;
 	}
 
 	public getUsedContext(): ChatDocumentContext[] {
 		return this._usedContext;
 	}
 
-	public getReferences(): PromptReference[] {
-		return this._references;
-	}
-
-	public getReplyInterpreterFactory(): ReplyInterpreterFactory | null {
-		return this._replyInterpreterFactory;
-	}
-
 	protected createElement(element: QueueItem<PromptElementCtor<P, any>, P>) {
 		return new element.ctor(element.props);
 	}
 
-	private async _processPromptPieces(progress?: Progress<ChatResponsePart>, token?: CancellationToken) {
-		while (this._queue.length > 0) {
-
-			// Collect all prompt elements to render
-			const promptElements: { element: any; promptElementInstance: PromptElement<any, any> }[] = [];
-			for (const element of this._queue.values()) {
-				// Set any jsx children as the props.children
-				if (Array.isArray(element.children)) {
-					element.props = (element.props ?? {});
-					(element.props as any).children = element.children; // todo@joyceerhl clean up any
-				}
-
-				// Instantiate the prompt part
-				if (!element.ctor) {
-					throw new Error(`Invalid ChatMessage child! Child must be a TSX component that extends PromptElement.`);
-				}
-
-				const promptElement = this.createElement(element);
-				element.node.setObj(promptElement);
-
-				// Prepare rendering
-				promptElements.push({ element, promptElementInstance: promptElement });
+	private async _processPromptPieces(
+		sizing: PromptSizingContext,
+		pieces: QueueItem<PromptElementCtor<P, any>, P>[],
+		progress?: Progress<ChatResponsePart>,
+		token?: CancellationToken
+	) {
+		// Collect all prompt elements in the next flex group to render, grouping
+		// by the flex order in which they're rendered.
+		const promptElements = new Map<
+			number,
+			{
+				element: QueueItem<PromptElementCtor<P, any>, P>;
+				promptElementInstance: PromptElement<any, any>;
+				tokenLimit: number | undefined;
+			}[]
+		>();
+		for (const [i, element] of pieces.entries()) {
+			// Set any jsx children as the props.children
+			if (Array.isArray(element.children)) {
+				element.props = element.props ?? {};
+				(element.props as any).children = element.children; // todo@joyceerhl clean up any
 			}
 
-			// Clear the queue
-			this._queue.splice(0, this._queue.length);
+			// Instantiate the prompt part
+			if (!element.ctor) {
+				const loc = atPath(element.path);
+				throw new Error(
+					`Invalid ChatMessage child! Child must be a TSX component that extends PromptElement at ${loc}`
+				);
+			}
 
-			// Prepare all currently known prompt elements in parallel
-			await Promise.all(promptElements.map(({ element, promptElementInstance }) => promptElementInstance.prepare?.(element.node.sizing, progress, token).then((state) => element.node.setState(state))));
+			const promptElement = this.createElement(element);
+			let tokenLimit: number | undefined;
+			if (promptElement instanceof TokenLimit) {
+				tokenLimit = (element.props as unknown as TokenLimitProps).max;
+				this._tokenLimits.push({ limit: tokenLimit, id: element.node.id });
+			}
+			element.node.setObj(promptElement);
+
+			// Prepare rendering
+			const flexGroupValue = element.props.flexGrow ?? Infinity;
+			let flexGroup = promptElements.get(flexGroupValue);
+			if (!flexGroup) {
+				flexGroup = [];
+				promptElements.set(flexGroupValue, flexGroup);
+			}
+
+			flexGroup.push({ element, promptElementInstance: promptElement, tokenLimit });
+		}
+
+		if (promptElements.size === 0) {
+			return;
+		}
+
+		const flexGroups = [...promptElements.entries()]
+			.sort(([a], [b]) => b - a)
+			.map(([_, group]) => group);
+		const setReserved = (groupIndex: number) => {
+			let reservedTokens = 0;
+			for (let i = groupIndex + 1; i < flexGroups.length; i++) {
+				for (const { element } of flexGroups[i]) {
+					if (!element.props.flexReserve) {
+						continue;
+					}
+					const reserve =
+						typeof element.props.flexReserve === 'string'
+							? // Typings ensure the string is `/${number}`
+							  Math.floor(sizing.remainingTokenBudget / Number(element.props.flexReserve.slice(1)))
+							: element.props.flexReserve;
+					reservedTokens += reserve;
+				}
+			}
+
+			sizing.consume(reservedTokens);
+			return reservedTokens;
+		};
+
+		// Prepare all currently known prompt elements in parallel
+		for (const [groupIndex, promptElements] of flexGroups.entries()) {
+			// Temporarily consume any reserved budget for later elements so that the sizing is calculated correctly here.
+			const reservedTokens = setReserved(groupIndex);
+
+			// Calculate the flex basis for dividing the budget amongst siblings in this group.
+			let flexBasisSum = 0;
+			for (const { element } of promptElements) {
+				flexBasisSum += element.props.flexBasis ?? 1;
+			}
+
+			let constantTokenLimits = 0;
+			//.For elements that limit their token usage and would use less than we
+			// otherwise would assign to them, 'cap' their usage at the limit and
+			// remove their share directly from the budget in distribution.
+			const useConstantLimitsForIndex = promptElements.map(e => {
+				if (e.tokenLimit === undefined) {
+					return false;
+				}
+
+				const flexBasis = e.element.props.flexBasis ?? 1;
+				const proportion = flexBasis / flexBasisSum;
+				const proportionateUsage = Math.floor(sizing.remainingTokenBudget * proportion);
+				if (proportionateUsage < e.tokenLimit) {
+					return false;
+				}
+
+				flexBasisSum -= flexBasis;
+				constantTokenLimits += e.tokenLimit;
+				return true;
+			});
+
+			// Finally calculate the final sizing for each element in this group.
+			const elementSizings: PromptSizing[] = promptElements.map((e, i) => {
+				const proportion = (e.element.props.flexBasis ?? 1) / flexBasisSum;
+				return {
+					tokenBudget: useConstantLimitsForIndex[i]
+						? e.tokenLimit!
+						: Math.floor((sizing.remainingTokenBudget - constantTokenLimits) * proportion),
+					endpoint: sizing.endpoint,
+					countTokens: (text, cancellation) =>
+						this._tokenizer.tokenLength(
+							typeof text === 'string'
+								? { type: Raw.ChatCompletionContentPartKind.Text, text }
+								: text,
+							cancellation
+						),
+				};
+			});
+
+			// Free the previously-reserved budget now that we calculated sizing
+			sizing.consume(-reservedTokens);
+
+			this.tracer?.addRenderEpoch?.({
+				inNode: promptElements[0].element.node.parent?.id,
+				flexValue: promptElements[0].element.props.flexGrow ?? 0,
+				tokenBudget: sizing.remainingTokenBudget,
+				reservedTokens,
+				elements: promptElements.map((e, i) => ({
+					id: e.element.node.id,
+					tokenBudget: elementSizings[i].tokenBudget,
+				})),
+			});
+
+			await Promise.all(
+				promptElements.map(async ({ element, promptElementInstance }, i) => {
+					const state = await annotateError(element, () =>
+						promptElementInstance.prepare?.(elementSizings[i], progress, token)
+					);
+					element.node.setState(state);
+				})
+			);
+
+			const templates = await Promise.all(
+				promptElements.map(async ({ element, promptElementInstance }, i) => {
+					const elementSizing = elementSizings[i];
+					return await annotateError(element, () =>
+						promptElementInstance.render(element.node.getState(), elementSizing, progress, token)
+					);
+				})
+			);
 
 			// Render
-			for (const { element, promptElementInstance } of promptElements) {
-				const template = promptElementInstance.render(element.node.getState(), element.node.sizing);
+			for (const [i, { element, promptElementInstance }] of promptElements.entries()) {
+				const elementSizing = elementSizings[i];
+				const template = templates[i];
 
 				if (!template) {
 					// it doesn't want to render anything
 					continue;
 				}
 
-				const pieces = flattenAndReduce(template);
+				const childConsumption = await this._processPromptRenderPiece(
+					new PromptSizingContext(elementSizing.tokenBudget, this._endpoint),
+					element,
+					promptElementInstance,
+					template,
+					progress,
+					token
+				);
 
-				// Compute token budget for the pieces that this child wants to render
-				const { flexChildrenSum, parentTokenBudgetWithoutLiterals } = computeTokenBudgetForPieces(this._tokenizer, element, promptElementInstance, pieces);
-
-				for (const piece of pieces) {
-					this._handlePromptPiece(element, piece, flexChildrenSum, parentTokenBudgetWithoutLiterals);
+				// Append growables here so that when we go back and expand them we do so in render order.
+				if (promptElementInstance instanceof Expandable) {
+					this._growables.push({ initialConsume: childConsumption, elem: element.node });
 				}
+
+				// Tally up the child consumption into the parent context for any subsequent flex group
+				sizing.consume(childConsumption);
 			}
 		}
 	}
 
-	private _prioritize<T extends Countable>(things: T[], cmp: (a: T, b: T) => number, count: (thing: T) => number) {
-		const prioritizedChunks: { index: number; precedingLinebreak?: number }[] = []; // sorted by descending priority
-		const chunkResult: (T | null)[] = [];
+	private async _processPromptRenderPiece(
+		elementSizing: PromptSizingContext,
+		element: QueueItem<PromptElementCtor<any, any>, any>,
+		promptElementInstance: PromptElement<any, any>,
+		template: PromptPiece,
+		progress: Progress<ChatResponsePart> | undefined,
+		token: CancellationToken | undefined
+	) {
+		const pieces = flattenAndReduce(template);
 
-		let i = 0;
-		while (i < things.length) {
-			// We only consider non-linebreaks for prioritization
-			if (!things[i].isImplicitLinebreak) {
-				const chunk = things[i - 1]?.isImplicitLinebreak ? { index: i, precedingLinebreak: i - 1 } : { index: i };
-				prioritizedChunks.push(chunk);
-				chunkResult[i] = null;
-			}
-			i += 1;
-		}
+		// Compute token budget for the pieces that this child wants to render
+		const childSizing = new PromptSizingContext(elementSizing.tokenBudget, this._endpoint);
+		const { tokensConsumed } = await computeTokensConsumedByLiterals(
+			this._tokenizer,
+			element,
+			promptElementInstance,
+			pieces
+		);
+		childSizing.consume(tokensConsumed);
+		await this._handlePromptChildren(element, pieces, childSizing, progress, token);
 
-		prioritizedChunks.sort((a, b) => cmp(things[a.index], things[b.index]));
+		// Tally up the child consumption into the parent context for any subsequent flex group
+		return childSizing.consumed;
+	}
 
-		let remainingBudget = this._endpoint.modelMaxPromptTokens - BaseTokensPerCompletion;
-		while (prioritizedChunks.length > 0) {
-			const prioritizedChunk = prioritizedChunks.shift()!;
-			const index = prioritizedChunk.index;
-			const chunk = things[index];
-			let tokenCount = count(chunk);
-			let precedingLinebreak;
-			if (prioritizedChunk.precedingLinebreak) {
-				precedingLinebreak = things[prioritizedChunk.precedingLinebreak];
-				tokenCount += count(precedingLinebreak);
-			}
-			if (tokenCount > remainingBudget) {
-				// Wouldn't fit anymore
-				break;
-			}
-			chunkResult[index] = chunk;
-			if (prioritizedChunk.precedingLinebreak && precedingLinebreak) {
-				chunkResult[prioritizedChunk.precedingLinebreak] = precedingLinebreak;
-			}
-			remainingBudget -= tokenCount;
-		}
+	/**
+	 * Renders the prompt element and its children to a JSON-serializable state.
+	 * @returns A promise that resolves to an object containing the rendered chat messages and the total token count.
+	 * The total token count is guaranteed to be less than or equal to the token budget.
+	 */
+	public async renderElementJSON(token?: CancellationToken): Promise<JSONT.PromptElementJSON> {
+		await this._processPromptPieces(
+			new PromptSizingContext(this._endpoint.modelMaxPromptTokens, this._endpoint),
+			[
+				{
+					node: this._root,
+					ctor: this._ctor,
+					props: this._props,
+					children: [],
+					path: [this._ctor],
+				},
+			],
+			undefined,
+			token
+		);
 
-		return { result: chunkResult, tokenCount: this._endpoint.modelMaxPromptTokens - remainingBudget };
+		// todo@connor4312: should ignored files, used context, etc. be passed here?
+		return {
+			node: this._root.toJSON(),
+		};
 	}
 
 	/**
@@ -203,156 +380,420 @@ export class PromptRenderer<P extends BasePromptElementProps> {
 	 * @returns A promise that resolves to an object containing the rendered chat messages and the total token count.
 	 * The total token count is guaranteed to be less than or equal to the token budget.
 	 */
-	public async render(progress?: Progress<ChatResponsePart>, token?: CancellationToken): Promise<RenderPromptResult> {
+	public async render(
+		progress?: Progress<ChatResponsePart>,
+		token?: CancellationToken
+	): Promise<RenderPromptResult<M>> {
+		const result = await this.renderRaw(progress, token);
+		return { ...result, messages: toMode(this._tokenizer.mode, result.messages) };
+	}
+
+	/**
+	 * Renders the prompt element and its children. Similar to {@link render}, but
+	 * returns the original message representation.
+	 */
+	public async renderRaw(
+		progress?: Progress<ChatResponsePart>,
+		token?: CancellationToken
+	): Promise<RenderPromptResult<OutputMode.Raw>> {
 		// Convert root prompt element to prompt pieces
-		await this._processPromptPieces(progress, token);
+		await this._processPromptPieces(
+			new PromptSizingContext(this._endpoint.modelMaxPromptTokens, this._endpoint),
+			[
+				{
+					node: this._root,
+					ctor: this._ctor,
+					props: this._props,
+					children: [],
+					path: [this._ctor],
+				},
+			],
+			progress,
+			token
+		);
 
-		// Convert prompt pieces to message chunks (text and linebreaks)
-		const { result: messages, resultChunks } = this._root.materialize();
+		const { container, allMetadata, removed } = await this._getFinalElementTree(
+			this._endpoint.modelMaxPromptTokens,
+			token
+		);
+		this.tracer?.didMaterializeTree?.({
+			budget: this._endpoint.modelMaxPromptTokens,
+			renderedTree: { container, removed, budget: this._endpoint.modelMaxPromptTokens },
+			tokenizer: this._tokenizer,
+			renderTree: budget =>
+				this._getFinalElementTree(budget, undefined).then(r => ({ ...r, budget })),
+		});
 
-		// First pass: sort message chunks by priority. Note that this can yield an imprecise result due to token boundaries within a single chat message
-		// so we also need to do a second pass over the full chat messages later
-		const chunkMessages = new Set<MaterializedChatMessage>();
-		const { result: prioritizedChunks } = this._prioritize(
-			resultChunks,
-			(a, b) => MaterializedChatMessageTextChunk.cmp(a, b),
-			(chunk) => {
-				let tokenLength = this._tokenizer.tokenLength(chunk.text);
-				if (!chunkMessages.has(chunk.message)) {
-					chunkMessages.add(chunk.message);
-					tokenLength = this._tokenizer.countMessageTokens(chunk.toChatMessage());
+		// Then finalize the chat messages
+		const messageResult = [...container.toChatMessages()];
+		const tokenCount = await container.tokenCount(this._tokenizer);
+		const remainingMetadata = [...container.allMetadata()];
+
+		// Remove undefined and duplicate references
+		const referenceNames = new Set<string>();
+		const references = remainingMetadata
+			.map(m => {
+				if (!(m instanceof ReferenceMetadata)) {
+					return;
 				}
-				return tokenLength;
-			});
 
-		// Update chat messages with their chunks that survived prioritization
-		const chatMessagesToChunks = new Map<MaterializedChatMessage, MaterializedChatMessageTextChunk[]>();
-		for (const chunk of coalesce(prioritizedChunks)) {
-			const value = chatMessagesToChunks.get(chunk.message) ?? [];
-			value[chunk.childIndex] = chunk;
-			chatMessagesToChunks.set(chunk.message, value);
-		}
+				const ref = m.reference;
+				const isVariableName = 'variableName' in ref.anchor;
+				if (isVariableName && !referenceNames.has(ref.anchor.variableName)) {
+					referenceNames.add(ref.anchor.variableName);
+					return ref;
+				} else if (!isVariableName) {
+					return ref;
+				}
+			})
+			.filter(isDefined);
 
-		// Collect chat messages with surviving prioritized chunks in the order they were declared
-		const chatMessages: MaterializedChatMessage[] = [];
-		for (const message of messages) {
-			const chunks = chatMessagesToChunks.get(message);
-			if (chunks) {
-				message.chunks = coalesce(chunks);
-				chatMessages.push(message);
+		// Collect the references for chat message chunks that did not survive prioritization
+		const omittedReferences = allMetadata
+			.map(m => {
+				if (!(m instanceof ReferenceMetadata) || remainingMetadata.includes(m)) {
+					return;
+				}
+
+				const ref = m.reference;
+				const isVariableName = 'variableName' in ref.anchor;
+				if (isVariableName && !referenceNames.has(ref.anchor.variableName)) {
+					referenceNames.add(ref.anchor.variableName);
+					return ref;
+				} else if (!isVariableName) {
+					return ref;
+				}
+			})
+			.filter(isDefined);
+
+		return {
+			metadata: MetadataMap.from(remainingMetadata),
+			messages: messageResult,
+			hasIgnoredFiles: this._ignoredFiles.length > 0,
+			tokenCount,
+			references,
+			omittedReferences,
+		};
+	}
+
+	/**
+	 * Note: this may be called multiple times from the tracer as users play
+	 * around with budgets. It should be side-effect-free.
+	 */
+	private async _getFinalElementTree(tokenBudget: number, token: CancellationToken | undefined) {
+		const root = this._root.materialize() as GenericMaterializedContainer;
+		const originalMessages = [...root.toChatMessages()];
+		const allMetadata = [...root.allMetadata()];
+		const limits = [{ limit: tokenBudget, id: this._root.id }, ...this._tokenLimits];
+		let removed = 0;
+
+		for (let i = limits.length - 1; i >= 0; i--) {
+			const limit = limits[i];
+			if (limit.limit > tokenBudget) {
+				continue;
+			}
+
+			const container = root.findById(limit.id);
+			if (!container) {
+				continue;
+			}
+
+			const initialTokenCount = await container.tokenCount(this._tokenizer);
+			if (initialTokenCount < limit.limit) {
+				const didChange = await this._grow(container, initialTokenCount, limit.limit, token);
+
+				// if nothing grew, we already counted tokens so we can safely return
+				if (!didChange) {
+					continue;
+				}
+			}
+
+			// Trim the elements to fit within the token budget. The "upper bound" count
+			// is a cachable count derived from the individual token counts of each component.
+			// The actual token count is <= the upper bound count due to BPE merging of tokens
+			// at component boundaries.
+			//
+			// To avoid excess tokenization, we first calculate the precise token
+			// usage of the message, and then remove components, subtracting their
+			// "upper bound" usage from the count until it's <= the budget. We then
+			// repeat this and refine as necessary, though most of the time we only
+			// need a single iteration of this.<sup>[citation needed]</sup>
+			try {
+				let tokenCount = await container.tokenCount(this._tokenizer);
+				while (tokenCount > limit.limit) {
+					const overhead = await container.baseMessageTokenCount(this._tokenizer);
+					do {
+						for (const node of container.removeLowestPriorityChild()) {
+							removed++;
+							const rmCount = node.upperBoundTokenCount(this._tokenizer);
+							// buffer an extra 25% to roughly account for any potential undercount
+							tokenCount -= (typeof rmCount === 'number' ? rmCount : await rmCount) * 1.25;
+						}
+					} while (tokenCount - overhead > limit.limit);
+					tokenCount = await container.tokenCount(this._tokenizer);
+				}
+			} catch (e) {
+				if (e instanceof BudgetExceededError) {
+					e.metadata = MetadataMap.from([...root.allMetadata()]);
+					e.messages = originalMessages;
+				}
+				throw e;
 			}
 		}
 
-		// Second pass: make sure the chat messages will fit within the token budget
-		const { result: prioritizedMaterializedChatMessages, tokenCount } = this._prioritize(chatMessages, (a, b) => MaterializedChatMessage.cmp(a, b), (message) => this._tokenizer.countMessageTokens(message.toChatMessage()));
-
-		// Then finalize the chat messages
-		const messageResult = prioritizedMaterializedChatMessages.map(message => message?.toChatMessage());
-
-		return { messages: this._validate(coalesce(messageResult)), hasIgnoredFiles: this._ignoredFiles.length > 0, tokenCount };
+		return { container: root, allMetadata, removed };
 	}
 
-	private _validate(chatMessages: ChatMessage[]) {
-		const lastMessage = chatMessages[chatMessages.length - 1];
-		if (lastMessage && lastMessage.role !== ChatRole.User) {
-			// User message was dropped, which will result in a 400 error from the server
-			console.error('Sorry, this message is too long. Please try a shorter question.');
+	/** Grows all Expandable elements, returns if any changes were made. */
+	private async _grow(
+		tree: GenericMaterializedContainer | MaterializedChatMessage,
+		tokensUsed: number,
+		tokenBudget: number,
+		token: CancellationToken | undefined
+	): Promise<boolean> {
+		if (!this._growables.length) {
+			return false;
 		}
 
-		return chatMessages;
+		for (const growable of this._growables) {
+			if (!tree.findById(growable.elem.id)) {
+				continue; // not in this subtree
+			}
+
+			const obj = growable.elem.getObj();
+			if (!(obj instanceof Expandable)) {
+				throw new Error('unreachable: expected growable');
+			}
+
+			const tempRoot = new PromptTreeElement(null, 0, growable.elem.id);
+			// Sizing for the grow is the remaining excess plus the initial consumption,
+			// since the element consuming the initial amount of tokens will be replaced
+			const sizing = new PromptSizingContext(
+				tokenBudget - tokensUsed + growable.initialConsume,
+				this._endpoint
+			);
+
+			const newConsumed = await this._processPromptRenderPiece(
+				sizing,
+				{ node: tempRoot, ctor: this._ctor, props: {}, children: [], path: [this._ctor] },
+				obj,
+				await obj.render(undefined, {
+					tokenBudget: sizing.tokenBudget,
+					endpoint: this._endpoint,
+					countTokens: (text, cancellation) =>
+						this._tokenizer.tokenLength(
+							typeof text === 'string'
+								? { type: Raw.ChatCompletionContentPartKind.Text, text }
+								: text,
+							cancellation
+						),
+				}),
+				undefined,
+				token
+			);
+
+			const newContainer = tempRoot.materialize() as GenericMaterializedContainer;
+			const oldContainer = tree.replaceNode(growable.elem.id, newContainer);
+			if (!oldContainer) {
+				throw new Error('unreachable: could not find old element to replace');
+			}
+
+			tokensUsed -= growable.initialConsume;
+			tokensUsed += newConsumed;
+			if (tokensUsed >= tokenBudget) {
+				break;
+			}
+		}
+
+		return true;
 	}
 
-	private _handlePromptPiece(element: QueueItem<PromptElementCtor<P, any>, P>, piece: ProcessedPromptPiece, siblingflexSum: number, parentTokenBudget: number) {
-		if (piece.kind === 'literal') {
-			element.node.appendStringChild(piece.value, element.props.priority ?? Number.MAX_SAFE_INTEGER);
-			return;
-		}
-		if (piece.kind === 'intrinsic') {
-			// intrinsic element
-			this._handleIntrinsic(element.node, piece.name, { priority: element.props.priority ?? Number.MAX_SAFE_INTEGER, ...piece.props }, flattenAndReduceArr(piece.children));
-			return;
-		}
-		if (piece.ctor === TextChunk) {
-			// text chunk
-			this._handleExtrinsicTextChunk(element.node, { priority: element.props.priority ?? Number.MAX_SAFE_INTEGER, ...piece.props }, flattenAndReduceArr(piece.children));
+	private _handlePromptChildren(
+		element: QueueItem<PromptElementCtor<any, any>, P>,
+		pieces: ProcessedPromptPiece[],
+		sizing: PromptSizingContext,
+		progress: Progress<ChatResponsePart> | undefined,
+		token: CancellationToken | undefined
+	) {
+		if (element.ctor === TextChunk) {
+			this._handleExtrinsicTextChunkChildren(element.node, element.node, element.props, pieces);
 			return;
 		}
 
-		const childNode = element.node.createChild({
-			tokenBudget: Math.floor(parentTokenBudget * (piece.props?.flex ?? 1) / siblingflexSum),
-			endpoint: this._endpoint
-		});
+		let todo: QueueItem<PromptElementCtor<P, any>, P>[] = [];
+		for (const piece of pieces) {
+			if (piece.kind === 'literal') {
+				element.node.appendStringChild(
+					piece.value,
+					element.props.priority ?? Number.MAX_SAFE_INTEGER
+				);
+				continue;
+			}
+			if (piece.kind === 'intrinsic') {
+				// intrinsic element
+				this._handleIntrinsic(
+					element.node,
+					piece.name,
+					{
+						priority: element.props.priority ?? Number.MAX_SAFE_INTEGER,
+						...piece.props,
+					},
+					flattenAndReduceArr(piece.children)
+				);
+				continue;
+			}
 
-		this._queue.push({ node: childNode, ctor: piece.ctor, props: { priority: element.props.priority, ...piece.props }, children: piece.children });
+			const childNode = element.node.createChild();
+			todo.push({
+				node: childNode,
+				ctor: piece.ctor,
+				props: piece.props,
+				children: piece.children,
+				path: [...element.path, piece.ctor],
+			});
+		}
+
+		return this._processPromptPieces(sizing, todo, progress, token);
 	}
 
-	private _handleIntrinsic(node: PromptTreeElement, name: string, props: any, children: ProcessedPromptPiece[]): void {
+	private _handleIntrinsic(
+		node: PromptTreeElement,
+		name: string,
+		props: any,
+		children: ProcessedPromptPiece[],
+		sortIndex?: number
+	): void {
 		switch (name) {
 			case 'meta':
 				return this._handleIntrinsicMeta(node, props, children);
 			case 'br':
-				return this._handleIntrinsicLineBreak(node, props, children, props.priority);
+				return this._handleIntrinsicLineBreak(node, props, children, props.priority, sortIndex);
 			case 'usedContext':
 				return this._handleIntrinsicUsedContext(node, props, children);
 			case 'references':
 				return this._handleIntrinsicReferences(node, props, children);
 			case 'ignoredFiles':
 				return this._handleIntrinsicIgnoredFiles(node, props, children);
-			case 'replyInterpreter':
-				return this._handleIntrinsicReplyInterpreter(node, props, children);
+			case 'elementJSON':
+				return this._handleIntrinsicElementJSON(node, props.data);
+			case 'cacheBreakpoint':
+				return this._handleIntrinsicCacheBreakpoint(node, props, children, sortIndex);
+			case 'opaque':
+				return this._handleIntrinsicOpaque(node, props, sortIndex);
 		}
 		throw new Error(`Unknown intrinsic element ${name}!`);
 	}
 
-	private _handleIntrinsicMeta(node: PromptTreeElement, props: JSX.IntrinsicElements['meta'], children: ProcessedPromptPiece[]) {
+	private _handleIntrinsicCacheBreakpoint(
+		node: PromptTreeElement,
+		props: any,
+		children: ProcessedPromptPiece[],
+		sortIndex?: number
+	) {
+		if (children.length > 0) {
+			throw new Error(`<cacheBreakpoint /> must not have children!`);
+		}
+
+		node.addCacheBreakpoint(props, sortIndex);
+	}
+
+	private _handleIntrinsicMeta(
+		node: PromptTreeElement,
+		props: JSX.IntrinsicElements['meta'],
+		children: ProcessedPromptPiece[]
+	) {
 		if (children.length > 0) {
 			throw new Error(`<meta /> must not have children!`);
 		}
-		const key = Object.getPrototypeOf(props.value).constructor;
-		if (this._meta.has(key)) {
-			throw new Error(`Duplicate metadata ${key.name}!`);
+
+		if (props.local) {
+			node.addMetadata(props.value);
+		} else {
+			this._root.addMetadata(props.value);
 		}
-		this._meta.set(key, props.value);
 	}
 
-	private _handleIntrinsicLineBreak(node: PromptTreeElement, props: JSX.IntrinsicElements['br'], children: ProcessedPromptPiece[], inheritedPriority?: number) {
+	private _handleIntrinsicLineBreak(
+		node: PromptTreeElement,
+		props: JSX.IntrinsicElements['br'],
+		children: ProcessedPromptPiece[],
+		inheritedPriority?: number,
+		sortIndex?: number
+	) {
 		if (children.length > 0) {
 			throw new Error(`<br /> must not have children!`);
 		}
-		node.appendLineBreak(true, inheritedPriority ?? Number.MAX_SAFE_INTEGER);
+		node.appendLineBreak(inheritedPriority ?? Number.MAX_SAFE_INTEGER, sortIndex);
 	}
 
-	private _handleIntrinsicUsedContext(node: PromptTreeElement, props: JSX.IntrinsicElements['usedContext'], children: ProcessedPromptPiece[]) {
+	private _handleIntrinsicOpaque(
+		node: PromptTreeElement,
+		props: JSX.IntrinsicElements['opaque'],
+		sortIndex?: number
+	) {
+		node.appendOpaque(props.value, props.tokenUsage, props.priority, sortIndex);
+	}
+
+	private _handleIntrinsicElementJSON(node: PromptTreeElement, data: JSONT.PromptElementJSON) {
+		const appended = node.appendPieceJSON(data.node);
+		if (this.tracer?.includeInEpoch) {
+			for (const child of appended.elements()) {
+				// tokenBudget is just 0 because we don't know the renderer state on the tool side.
+				this.tracer.includeInEpoch({ id: child.id, tokenBudget: 0 });
+			}
+		}
+	}
+
+	private _handleIntrinsicUsedContext(
+		node: PromptTreeElement,
+		props: JSX.IntrinsicElements['usedContext'],
+		children: ProcessedPromptPiece[]
+	) {
 		if (children.length > 0) {
 			throw new Error(`<usedContext /> must not have children!`);
 		}
 		this._usedContext.push(...props.value);
 	}
 
-	private _handleIntrinsicReferences(node: PromptTreeElement, props: JSX.IntrinsicElements['references'], children: ProcessedPromptPiece[]) {
+	private _handleIntrinsicReferences(
+		node: PromptTreeElement,
+		props: JSX.IntrinsicElements['references'],
+		children: ProcessedPromptPiece[]
+	) {
 		if (children.length > 0) {
 			throw new Error(`<reference /> must not have children!`);
 		}
-		this._references.push(...props.value);
+		for (const ref of props.value) {
+			node.addMetadata(new ReferenceMetadata(ref));
+		}
 	}
 
-
-	private _handleIntrinsicIgnoredFiles(node: PromptTreeElement, props: JSX.IntrinsicElements['ignoredFiles'], children: ProcessedPromptPiece[]) {
+	private _handleIntrinsicIgnoredFiles(
+		node: PromptTreeElement,
+		props: JSX.IntrinsicElements['ignoredFiles'],
+		children: ProcessedPromptPiece[]
+	) {
 		if (children.length > 0) {
 			throw new Error(`<ignoredFiles /> must not have children!`);
 		}
 		this._ignoredFiles.push(...props.value);
 	}
 
-	private _handleIntrinsicReplyInterpreter(node: PromptTreeElement, props: JSX.IntrinsicElements['replyInterpreter'], children: ProcessedPromptPiece[]) {
-		if (children.length > 0) {
-			throw new Error(`<replyInterpreter /> must not have children!`);
-		}
-		this._replyInterpreterFactory = props.value;
-	}
-
-	private _handleExtrinsicTextChunk(node: PromptTreeElement, props: BasePromptElementProps, children: ProcessedPromptPiece[]) {
+	/**
+	 * @param node Parent of the <TextChunk />
+	 * @param textChunkNode The <TextChunk /> node. All children are in-order
+	 * appended to the parent using the same sort index to ensure order is preserved.
+	 * @param props Props of the <TextChunk />
+	 * @param children Rendered children of the <TextChunk />
+	 */
+	private _handleExtrinsicTextChunkChildren(
+		node: PromptTreeElement,
+		textChunkNode: PromptTreeElement,
+		props: BasePromptElementProps,
+		children: ProcessedPromptPiece[]
+	) {
 		const content: string[] = [];
+		const metadata: PromptMetadata[] = [];
 
 		for (const child of children) {
 			if (child.kind === 'extrinsic') {
@@ -367,63 +808,98 @@ export class PromptRenderer<P extends BasePromptElementProps> {
 				if (child.name === 'br') {
 					// Preserve newlines
 					content.push('\n');
+				} else if (child.name === 'references') {
+					// For TextChunks, references must be propagated through the PromptText element that is appended to the node
+					for (const reference of child.props.value) {
+						metadata.push(new ReferenceMetadata(reference));
+					}
 				} else {
-					this._handleIntrinsic(node, child.name, child.props, flattenAndReduceArr(child.children));
+					this._handleIntrinsic(
+						node,
+						child.name,
+						child.props,
+						flattenAndReduceArr(child.children),
+						textChunkNode.childIndex
+					);
 				}
 			}
 		}
 
-		node.appendLineBreak(false);
-		node.appendStringChild(content.join(''), props?.priority ?? Number.MAX_SAFE_INTEGER);
+		node.appendStringChild(
+			content.join(''),
+			props?.priority ?? Number.MAX_SAFE_INTEGER,
+			metadata,
+			textChunkNode.childIndex,
+			true
+		);
 	}
 }
 
-function computeTokenBudgetForPieces(tokenizer: ITokenizer, element: any, instance: PromptElement<any, any>, pieces: ProcessedPromptPiece[]) {
-	let flexChildrenSum = 0;
-	let parentTokenBudgetWithoutLiterals = element.node.sizing.tokenBudget;
+async function computeTokensConsumedByLiterals(
+	tokenizer: ITokenizer,
+	element: QueueItem<PromptElementCtor<any, any>, any>,
+	instance: PromptElement<any, any>,
+	pieces: ProcessedPromptPiece[]
+) {
+	let tokensConsumed = 0;
+
 	if (isChatMessagePromptElement(instance)) {
-		parentTokenBudgetWithoutLiterals -= BaseTokensPerMessage;
-		if (element.props.name) {
-			parentTokenBudgetWithoutLiterals -= BaseTokensPerName;
-		}
-		if (element.props.role) {
-			parentTokenBudgetWithoutLiterals -= tokenizer.tokenLength(element.props.role);
-		}
+		const raw: Raw.ChatMessage = {
+			role: element.props.role,
+			content: [],
+			...(element.props.name ? { name: element.props.name } : undefined),
+			...(element.props.toolCalls ? { toolCalls: element.props.toolCalls } : undefined),
+			...(element.props.toolCallId ? { toolCallId: element.props.toolCallId } : undefined),
+		};
+
+		tokensConsumed += await tokenizer.countMessageTokens(toMode(tokenizer.mode, raw));
 	}
+
 	for (const piece of pieces) {
 		if (piece.kind === 'literal') {
-			parentTokenBudgetWithoutLiterals -= tokenizer.tokenLength(piece.value);
-		} else {
-			flexChildrenSum += piece.props?.flex ?? 1;
+			tokensConsumed += await tokenizer.tokenLength({
+				type: Raw.ChatCompletionContentPartKind.Text,
+				text: piece.value,
+			});
 		}
 	}
 
-	return { parentTokenBudgetWithoutLiterals, flexChildrenSum };
+	return { tokensConsumed };
 }
 
 // Flatten nested fragments and normalize children
-function flattenAndReduce(c: string | number | PromptPiece<any> | undefined): ProcessedPromptPiece[] {
+function flattenAndReduce(
+	c: string | number | PromptPiece<any> | undefined,
+	into: ProcessedPromptPiece[] = []
+): ProcessedPromptPiece[] {
 	if (typeof c === 'undefined' || typeof c === 'boolean') {
 		// booleans are ignored to allow for the pattern: { cond && <Element ... /> }
 		return [];
 	} else if (typeof c === 'string' || typeof c === 'number') {
-		return [new LiteralPromptPiece(String(c))];
+		into.push(new LiteralPromptPiece(String(c)));
 	} else if (isFragmentCtor(c)) {
-		return [...flattenAndReduceArr(c.children)];
+		flattenAndReduceArr(c.children, into);
+	} else if (isIterable(c)) {
+		flattenAndReduceArr(c, into);
 	} else if (typeof c.ctor === 'string') {
 		// intrinsic element
-		return [new IntrinsicPromptPiece(c.ctor, c.props, c.children)];
+		into.push(new IntrinsicPromptPiece(c.ctor, c.props, c.children));
 	} else {
 		// extrinsic element
-		return [new ExtrinsicPromptPiece(c.ctor, c.props, c.children)];
+		into.push(new ExtrinsicPromptPiece(c.ctor, c.props, c.children));
 	}
+
+	return into;
 }
 
-function flattenAndReduceArr(arr: PromptPieceChild[]): ProcessedPromptPiece[] {
-	return (arr ?? []).reduce((r, c) => {
-		r.push(...flattenAndReduce(c));
-		return r;
-	}, [] as ProcessedPromptPiece[]);
+function flattenAndReduceArr(
+	arr: Iterable<PromptPieceChild>,
+	into: ProcessedPromptPiece[] = []
+): ProcessedPromptPiece[] {
+	for (const entry of arr) {
+		flattenAndReduce(entry, into);
+	}
+	return into;
 }
 
 class IntrinsicPromptPiece<K extends keyof JSX.IntrinsicElements> {
@@ -433,7 +909,7 @@ class IntrinsicPromptPiece<K extends keyof JSX.IntrinsicElements> {
 		public readonly name: string,
 		public readonly props: JSX.IntrinsicElements[K],
 		public readonly children: PromptPieceChild[]
-	) { }
+	) {}
 }
 
 class ExtrinsicPromptPiece<P extends BasePromptElementProps = any, S = any> {
@@ -443,53 +919,174 @@ class ExtrinsicPromptPiece<P extends BasePromptElementProps = any, S = any> {
 		public readonly ctor: PromptElementCtor<P, S>,
 		public readonly props: P,
 		public readonly children: PromptPieceChild[]
-	) { }
+	) {}
 }
 
 class LiteralPromptPiece {
 	public readonly kind = 'literal';
 
+	constructor(public readonly value: string, public readonly priority?: number) {}
+}
+
+type ProcessedPromptPiece =
+	| LiteralPromptPiece
+	| IntrinsicPromptPiece<any>
+	| ExtrinsicPromptPiece<any, any>;
+
+type PromptNode = PromptTreeElement | PromptText | PromptCacheBreakpoint | PromptOpaque;
+
+class PromptOpaque {
+	public static fromJSON(
+		parent: PromptTreeElement,
+		index: number,
+		json: JSONT.OpaqueJSON
+	): PromptOpaque {
+		return new PromptOpaque(parent, index, json.value, json.tokenUsage, json.priority);
+	}
+
+	public readonly kind = PromptNodeType.Text;
+
 	constructor(
-		public readonly value: string,
+		public readonly parent: PromptTreeElement,
+		public readonly childIndex: number,
+		public readonly value: unknown,
+		public readonly tokenUsage?: number,
 		public readonly priority?: number
-	) { }
+	) {}
+
+	public materialize(parent: MaterializedChatMessage | GenericMaterializedContainer) {
+		return new MaterializedChatMessageOpaque(
+			parent,
+			{
+				type: Raw.ChatCompletionContentPartKind.Opaque,
+				value: this.value,
+				tokenUsage: this.tokenUsage,
+			},
+			this.priority
+		);
+	}
+
+	public toJSON(): JSONT.OpaqueJSON {
+		return {
+			type: JSONT.PromptNodeType.Opaque,
+			value: this.value,
+			tokenUsage: this.tokenUsage,
+			priority: this.priority,
+		};
+	}
 }
 
-type ProcessedPromptPiece = LiteralPromptPiece | IntrinsicPromptPiece<any> | ExtrinsicPromptPiece<any, any>;
+/**
+ * A shared instance given to each PromptTreeElement that contains information
+ * about the parent sizing and its children.
+ */
+class PromptSizingContext {
+	private _consumed = 0;
 
-const enum PromptNodeType {
-	Piece,
-	Text,
-	LineBreak
+	constructor(public readonly tokenBudget: number, public readonly endpoint: IChatEndpointInfo) {}
+
+	public get consumed() {
+		return this._consumed > this.tokenBudget ? this.tokenBudget : this._consumed;
+	}
+
+	public get remainingTokenBudget() {
+		return Math.max(0, this.tokenBudget - this._consumed);
+	}
+
+	/** Marks part of the budget as having been consumed by a render() call. */
+	public consume(budget: number) {
+		this._consumed += budget;
+	}
 }
-
-type PromptNode = PromptTreeElement | PromptText | PromptLineBreak;
-type LeafPromptNode = PromptText | PromptLineBreak;
 
 class PromptTreeElement {
+	private static _nextId = 0;
+
+	public static fromJSON(
+		index: number,
+		json: JSONT.PieceJSON,
+		keepWithMap: Map<number, KeepWithCtor>
+	): PromptTreeElement {
+		const element = new PromptTreeElement(null, index);
+		element._metadata =
+			json.references?.map(r => new ReferenceMetadata(PromptReference.fromJSON(r))) ?? [];
+		element._children = json.children
+			.map((childJson, i) => {
+				switch (childJson.type) {
+					case JSONT.PromptNodeType.Piece:
+						return PromptTreeElement.fromJSON(i, childJson, keepWithMap);
+					case JSONT.PromptNodeType.Text:
+						return PromptText.fromJSON(element, i, childJson);
+					case JSONT.PromptNodeType.Opaque:
+						return PromptOpaque.fromJSON(element, i, childJson);
+					default:
+						softAssertNever(childJson);
+				}
+			})
+			.filter(isDefined);
+
+		switch (json.ctor) {
+			case JSONT.PieceCtorKind.BaseChatMessage:
+				element._objFlags = json.flags ?? 0;
+				element._obj = new BaseChatMessage(json.props!);
+				break;
+			case JSONT.PieceCtorKind.Other: {
+				if (json.keepWithId !== undefined) {
+					let kw = keepWithMap.get(json.keepWithId);
+					if (!kw) {
+						kw = useKeepWith();
+						keepWithMap.set(json.keepWithId, kw);
+					}
+					element._obj = new kw(json.props || {});
+				} else {
+					element._obj = new LogicalWrapper(json.props || {});
+				}
+				element._objFlags = json.flags ?? 0;
+				break;
+			}
+			case JSONT.PieceCtorKind.ImageChatMessage:
+				element._obj = new Image(json.props!);
+				break;
+			case JSONT.PieceCtorKind.DocumentChatMessage:
+				element._obj = new Document(json.props!);
+				break;
+			default:
+				softAssertNever(json);
+		}
+
+		return element;
+	}
 
 	public readonly kind = PromptNodeType.Piece;
 
 	private _obj: PromptElement | null = null;
 	private _state: any | undefined = undefined;
 	private _children: PromptNode[] = [];
+	private _metadata: PromptMetadata[] = [];
+	private _objFlags: number = 0;
 
 	constructor(
 		public readonly parent: PromptTreeElement | null = null,
 		public readonly childIndex: number,
-		private _sizing: PromptSizing
-	) { }
-
-	public set sizing(sizing: PromptSizing) {
-		this._sizing = sizing;
-	}
-
-	public get sizing() {
-		return this._sizing;
-	}
+		public readonly id = PromptTreeElement._nextId++
+	) {}
 
 	public setObj(obj: PromptElement) {
 		this._obj = obj;
+
+		// todo@connor4312: clean this up so we don't actually hold _obj but instead
+		// just hold metadata that can be more cleanly rehydrated
+
+		if (this._obj instanceof LegacyPrioritization)
+			this._objFlags |= ContainerFlags.IsLegacyPrioritization;
+		if (this._obj instanceof Chunk) this._objFlags |= ContainerFlags.IsChunk;
+		if (this._obj instanceof IfEmpty) this._objFlags |= ContainerFlags.EmptyAlternate;
+		if (this._obj.props.passPriority) this._objFlags |= ContainerFlags.PassPriority;
+	}
+
+	/** @deprecated remove when Expandable is gone */
+	public getObj(): PromptElement | null {
+		return this._obj;
 	}
 
 	public setState(state: any) {
@@ -500,195 +1097,322 @@ class PromptTreeElement {
 		return this._state;
 	}
 
-	public createChild(sizing: PromptSizing): PromptTreeElement {
-		const child = new PromptTreeElement(this, this._children.length, sizing);
+	public createChild(): PromptTreeElement {
+		const child = new PromptTreeElement(this, this._children.length);
 		this._children.push(child);
 		return child;
 	}
 
-	public appendStringChild(text: string, priority?: number): void {
-		this._children.push(new PromptText(this, text, priority));
+	public appendPieceJSON(data: JSONT.PieceJSON): PromptTreeElement {
+		const child = PromptTreeElement.fromJSON(this._children.length, data, new Map());
+		this._children.push(child);
+		return child;
 	}
 
-	public appendLineBreak(explicit = true, priority?: number): void {
-		this._children.push(new PromptLineBreak(this, explicit, priority));
+	public appendStringChild(
+		text: string,
+		priority?: number,
+		metadata?: PromptMetadata[],
+		sortIndex = this._children.length,
+		lineBreakBefore = false
+	) {
+		this._children.push(new PromptText(this, sortIndex, text, priority, metadata, lineBreakBefore));
 	}
 
-	public materialize(): { result: MaterializedChatMessage[]; resultChunks: MaterializedChatMessageTextChunk[] } {
-		const result: MaterializedChatMessage[] = [];
-		const resultChunks: MaterializedChatMessageTextChunk[] = [];
-		this._materialize(result, resultChunks);
-		return { result, resultChunks };
+	public appendLineBreak(priority?: number, sortIndex = this._children.length): void {
+		this._children.push(new PromptText(this, sortIndex, '\n', priority));
 	}
 
-	private _materialize(result: MaterializedChatMessage[], resultChunks: MaterializedChatMessageTextChunk[]): void {
+	public appendOpaque(
+		value: unknown,
+		tokenUsage?: number,
+		priority?: number,
+		sortIndex = this._children.length
+	): void {
+		this._children.push(new PromptOpaque(this, sortIndex, value, tokenUsage, priority));
+	}
+
+	public toJSON(): JSONT.PieceJSON {
+		const json: JSONT.PieceJSON = {
+			type: JSONT.PromptNodeType.Piece,
+			ctor: JSONT.PieceCtorKind.Other,
+			ctorName: this._obj?.constructor.name,
+			children: this._children
+				.slice()
+				.sort((a, b) => a.childIndex - b.childIndex)
+				.map(c => c.toJSON())
+				.filter(isDefined),
+			props: {},
+			references: this._metadata
+				.filter(m => m instanceof ReferenceMetadata)
+				.map(r => r.reference.toJSON()),
+		};
+
+		if (this._obj) {
+			json.props = pickProps(this._obj.props, JSONT.jsonRetainedProps);
+		}
+
 		if (this._obj instanceof BaseChatMessage) {
-			if (!this._obj.props.role) {
+			json.ctor = JSONT.PieceCtorKind.BaseChatMessage;
+			Object.assign(
+				json.props,
+				pickProps(this._obj.props, ['role', 'name', 'toolCalls', 'toolCallId'])
+			);
+		} else if (this._obj instanceof Image) {
+			return {
+				...json,
+				ctor: JSONT.PieceCtorKind.ImageChatMessage,
+				props: {
+					...json.props,
+					...pickProps(this._obj.props, ['src', 'detail', 'mimeType']),
+				},
+			};
+		} else if (this._obj instanceof Document) {
+			return {
+				...json,
+				ctor: JSONT.PieceCtorKind.DocumentChatMessage,
+				props: {
+					...json.props,
+					...pickProps(this._obj.props, ['data', 'mediaType']),
+				},
+			};
+		} else if (this._obj instanceof AbstractKeepWith) {
+			json.keepWithId = this._obj.id;
+		}
+
+		if (this._objFlags !== 0) {
+			json.flags = this._objFlags;
+		}
+
+		return json;
+	}
+
+	public materialize(
+		parent?: MaterializedChatMessage | GenericMaterializedContainer
+	): MaterializedChatMessage | GenericMaterializedContainer | MaterializedChatMessageImage | MaterializedChatMessageDocument {
+		this._children.sort((a, b) => a.childIndex - b.childIndex);
+
+		if (this._obj instanceof Image) {
+			// #region materialize baseimage
+			return new MaterializedChatMessageImage(
+				parent,
+				this.id,
+				this._obj.props.src,
+				this._obj.props.priority ?? Number.MAX_SAFE_INTEGER,
+				this._metadata,
+				LineBreakBefore.None,
+				this._obj.props.detail ?? undefined,
+				this._obj.props.mimeType ?? undefined
+			);
+		}
+
+		if (this._obj instanceof Document) {
+			return new MaterializedChatMessageDocument(
+				parent,
+				this.id,
+				this._obj.props.data,
+				this._obj.props.mediaType,
+				this._obj.props.priority ?? Number.MAX_SAFE_INTEGER,
+				this._metadata,
+				LineBreakBefore.None,
+			);
+		}
+
+		if (this._obj instanceof BaseChatMessage) {
+			if (this._obj.props.role === undefined || typeof this._obj.props.role !== 'number') {
 				throw new Error(`Invalid ChatMessage!`);
 			}
-			const leafNodes: LeafPromptNode[] = [];
-			for (const child of this._children) {
-				child.collectLeafs(leafNodes);
-			}
-			const chunks: MaterializedChatMessageTextChunk[] = [];
-			const parent = new MaterializedChatMessage(
+
+			return new MaterializedChatMessage(
+				parent,
+				this.id,
 				this._obj.props.role,
 				this._obj.props.name,
-				this._obj.props.priority,
-				this.childIndex,
-				chunks
+				this._obj instanceof AssistantMessage ? this._obj.props.toolCalls : undefined,
+				this._obj instanceof ToolMessage ? this._obj.props.toolCallId : undefined,
+				this._obj.props.priority ?? Number.MAX_SAFE_INTEGER,
+				this._metadata,
+				parent => this._children.map(child => child.materialize(parent))
 			);
-			let childIndex = resultChunks.length;
-			leafNodes.forEach((node, index) => {
-				if (node.kind === PromptNodeType.Text) {
-					chunks.push(new MaterializedChatMessageTextChunk(parent, node.text, node.priority, childIndex++));
-				} else {
-					if (node.isExplicit) {
-						chunks.push(new MaterializedChatMessageTextChunk(parent, '\n', node.priority, childIndex++));
-					} else if (chunks.length > 0 && chunks[chunks.length - 1].text !== '\n' || chunks[index - 1] && chunks[index - 1].text !== '\n') {
-						// Only insert an implicit linebreak if there wasn't already an explicit linebreak before
-						chunks.push(new MaterializedChatMessageTextChunk(parent, '\n', node.priority, childIndex++, true));
-					}
-				}
-			});
-			resultChunks.push(...chunks);
-			result.push(parent);
 		} else {
-			for (const child of this._children) {
-				if (child.kind === PromptNodeType.Text) {
-					throw new Error(`Cannot have a text node outside a ChatMessage. Text: "${child.text}"`);
-				} else if (child.kind === PromptNodeType.LineBreak) {
-					throw new Error(`Cannot have a line break node outside a ChatMessage!`);
-				}
-				child._materialize(result, resultChunks);
+			const container = new GenericMaterializedContainer(
+				parent,
+				this.id,
+				this._obj?.constructor.name,
+				this._obj?.props.priority ?? (this._obj?.props.passPriority ? 0 : Number.MAX_SAFE_INTEGER),
+				parent => this._children.map(child => child.materialize(parent)),
+				this._metadata,
+				this._objFlags
+			);
+
+			if (this._obj instanceof AbstractKeepWith) {
+				container.keepWithId = this._obj.id;
 			}
+
+			return container;
 		}
 	}
 
-	public collectLeafs(result: LeafPromptNode[]): void {
-		if (this._obj instanceof BaseChatMessage) {
-			throw new Error(`Cannot have a ChatMessage nested inside a ChatMessage!`);
+	public addMetadata(metadata: PromptMetadata): void {
+		this._metadata.push(metadata);
+	}
+
+	public addCacheBreakpoint(breakpoint: { type: string }, sortIndex = this._children.length): void {
+		if (!(this._obj instanceof BaseChatMessage)) {
+			throw new Error('Cache breakpoints may only be direct children of chat messages');
 		}
-		if (this._obj?.insertLineBreakBefore) {
-			// Add an implicit <br/> before the element
-			result.push(new PromptLineBreak(this, false));
-		}
+
+		this._children.push(
+			new PromptCacheBreakpoint(
+				{ type: Raw.ChatCompletionContentPartKind.CacheBreakpoint, cacheType: breakpoint.type },
+				sortIndex
+			)
+		);
+	}
+
+	public *elements(): Iterable<PromptTreeElement> {
+		yield this;
 		for (const child of this._children) {
-			child.collectLeafs(result);
-		}
-	}
-}
-
-interface Countable {
-	text: string;
-	isImplicitLinebreak?: boolean;
-}
-
-class MaterializedChatMessageTextChunk implements Countable {
-	constructor(
-		public readonly message: MaterializedChatMessage,
-		public readonly text: string,
-		private readonly priority: number | undefined,
-		public readonly childIndex: number,
-		public readonly isImplicitLinebreak = false
-	) { }
-
-	public static cmp(a: MaterializedChatMessageTextChunk, b: MaterializedChatMessageTextChunk): number {
-		if (a.priority !== undefined && b.priority !== undefined && a.priority === b.priority) {
-			// If the chunks share the same parent, break priority ties based on the order
-			// that the chunks were declared in under its parent chat message
-			if (a.message === b.message) {
-				return a.childIndex - b.childIndex;
+			if (child instanceof PromptTreeElement) {
+				yield* child.elements();
 			}
-			// Otherwise, prioritize chunks that were declared last
-			return b.childIndex - a.childIndex;
 		}
-
-		if (a.priority !== undefined && b.priority !== undefined && a.priority !== b.priority) {
-			return b.priority - a.priority;
-		}
-
-		return a.childIndex - b.childIndex;
-	}
-
-	public toChatMessage() {
-		return {
-			role: this.message.role,
-			content: this.text,
-			...(this.message.name ? { name: this.message.name } : {})
-		};
 	}
 }
 
-class MaterializedChatMessage implements Countable {
+class PromptCacheBreakpoint {
 	constructor(
-		public readonly role: ChatRole,
-		public readonly name: string | undefined,
-		private readonly priority: number | undefined,
-		private readonly childIndex: number,
-		private _chunks: MaterializedChatMessageTextChunk[]
-	) { }
+		public readonly part: Raw.ChatCompletionContentPartCacheBreakpoint,
+		public readonly childIndex: number
+	) {}
 
-	public set chunks(chunks: MaterializedChatMessageTextChunk[]) {
-		this._chunks = chunks.sort(MaterializedChatMessageTextChunk.cmp);
+	public toJSON() {
+		return undefined;
 	}
 
-	public get text(): string {
-		return this._chunks.reduce((acc, c, i) => {
-			if (i !== (this._chunks.length - 1) || !c.isImplicitLinebreak) {
-				acc += c.text;
-			}
-			return acc;
-		}, '');
-	}
-
-	public toChatMessage(): ChatMessage {
-		return {
-			role: this.role,
-			content: this.text,
-			...(this.name ? { name: this.name } : {})
-		};
-	}
-
-	public static cmp(a: MaterializedChatMessage, b: MaterializedChatMessage): number {
-		if (a.priority !== b.priority) {
-			return (b.priority || 0) - (a.priority || 0);
-		}
-		return b.childIndex - a.childIndex;
+	public materialize(parent: MaterializedChatMessage | GenericMaterializedContainer) {
+		return new MaterializedChatMessageBreakpoint(parent, this.part);
 	}
 }
 
 class PromptText {
+	public static fromJSON(
+		parent: PromptTreeElement,
+		index: number,
+		json: JSONT.TextJSON
+	): PromptText {
+		return new PromptText(
+			parent,
+			index,
+			json.text,
+			json.priority,
+			json.references?.map(r => new ReferenceMetadata(PromptReference.fromJSON(r))),
+			json.lineBreakBefore
+		);
+	}
 
 	public readonly kind = PromptNodeType.Text;
 
 	constructor(
 		public readonly parent: PromptTreeElement,
+		public readonly childIndex: number,
 		public readonly text: string,
-		public readonly priority?: number
-	) { }
+		public readonly priority?: number,
+		public readonly metadata?: PromptMetadata[],
+		public readonly lineBreakBefore = false
+	) {}
 
-	public collectLeafs(result: LeafPromptNode[]) {
-		result.push(this);
+	public materialize(parent: MaterializedChatMessage | GenericMaterializedContainer) {
+		const lineBreak = this.lineBreakBefore
+			? LineBreakBefore.Always
+			: this.childIndex === 0
+			? LineBreakBefore.IfNotTextSibling
+			: LineBreakBefore.None;
+		return new MaterializedChatMessageTextChunk(
+			parent,
+			this.text,
+			this.priority ?? Number.MAX_SAFE_INTEGER,
+			this.metadata || [],
+			lineBreak
+		);
 	}
 
-}
-
-class PromptLineBreak {
-
-	public readonly kind = PromptNodeType.LineBreak;
-
-	constructor(
-		public readonly parent: PromptTreeElement,
-		public readonly isExplicit: boolean,
-		public readonly priority?: number
-	) { }
-
-	public collectLeafs(result: LeafPromptNode[]) {
-		result.push(this);
+	public toJSON(): JSONT.TextJSON {
+		return {
+			type: JSONT.PromptNodeType.Text,
+			priority: this.priority,
+			text: this.text,
+			references: this.metadata
+				?.filter(m => m instanceof ReferenceMetadata)
+				.map(r => r.reference.toJSON()),
+			lineBreakBefore: this.lineBreakBefore,
+		};
 	}
 }
 
 function isFragmentCtor(template: PromptPiece): boolean {
 	return (typeof template.ctor === 'function' && template.ctor.isFragment) ?? false;
+}
+
+function softAssertNever(x: never): void {
+	// note: does not actually throw, because we want to handle any unknown cases
+	// gracefully for forwards-compatibility
+}
+
+function isDefined<T>(x: T | undefined): x is T {
+	return x !== undefined;
+}
+
+class InternalMetadata extends PromptMetadata {}
+
+class ReferenceMetadata extends InternalMetadata {
+	constructor(public readonly reference: PromptReference) {
+		super();
+	}
+}
+
+function iterableToArray<T>(t: Iterable<T>): ReadonlyArray<T> {
+	if (isIterable(t)) {
+		return Array.from(t);
+	}
+
+	return t;
+}
+
+function isIterable(t: unknown): t is Iterable<any> {
+	return !!t && typeof (t as any)[Symbol.iterator] === 'function';
+}
+
+function pickProps<T extends {}, K extends keyof T>(obj: T, keys: readonly K[]): Pick<T, K> {
+	const result = {} as Pick<T, K>;
+	for (const key of keys) {
+		if (obj.hasOwnProperty(key)) {
+			result[key] = obj[key];
+		}
+	}
+	return result;
+}
+
+function atPath(path: (PromptElementCtor<any, any> | string)[]): string {
+	return path
+		.map(p => (typeof p === 'string' ? p : p ? p.name || '<anonymous>' : String(p)))
+		.join(' > ');
+}
+
+const annotatedErrors = new WeakSet<Error>();
+async function annotateError<T>(q: QueueItem<any, any>, fn: () => T | Promise<T>) {
+	try {
+		return await fn();
+	} catch (e) {
+		// Add a path to errors, except cancellation errors which are generally expected
+		if (
+			e instanceof Error &&
+			!annotatedErrors.has(e) &&
+			e.constructor.name !== 'CancellationError'
+		) {
+			annotatedErrors.add(e);
+			e.message += ` (at tsx element ${atPath(q.path)})`;
+		}
+		throw e;
+	}
 }

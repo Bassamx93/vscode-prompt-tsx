@@ -1,9 +1,9 @@
 {
-	"exclude": ["build"],
+	"exclude": ["build", "src/tracer"],
 	"include": ["src"],
 	"compilerOptions": {
 		"module": "commonjs",
-		"target": "es2020",
+		"target": "ES2022",
 		"outDir": "dist",
 		"rootDir": "src",
 		"strict": true,
@@ -12,6 +12,6 @@
 		"declaration": true,
 		"jsxFragmentFactory": "vscppf",
 		"moduleResolution": "node",
-		"types": ["vscode", "node", "mocha"]
+		"types": ["node", "mocha"]
 	}
 }
